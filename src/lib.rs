@@ -92,24 +92,31 @@ const WORDS: &[(&str, Tok)] = &[
     ("point", Tok::Point),
 ];
 
-fn split(s: &str, out: &mut Vec<Tok>) -> bool {
-    if s.is_empty() {
-        return true;
-    }
+struct Tokens<'a> {
+    rest: &'a str,
+}
 
-    for (word, tok) in WORDS {
-        let Some(rest) = s.strip_prefix(word) else {
-            continue;
+impl Iterator for Tokens<'_> {
+    type Item = Option<Tok>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rest.is_empty() {
+            return None;
+        }
+
+        let found = WORDS
+            .iter()
+            .filter(|(word, _)| self.rest.starts_with(word))
+            .max_by_key(|(word, _)| word.len());
+        let Some((word, tok)) = found else {
+            self.rest = "";
+            return Some(None);
         };
 
-        out.push(*tok);
-        if split(rest, out) {
-            return true;
-        }
-        out.pop();
-    }
+        self.rest = &self.rest[word.len()..];
 
-    false
+        Some(Some(*tok))
+    }
 }
 
 fn eval(mut toks: &[Tok]) -> Option<(Sign, u128)> {
@@ -174,10 +181,7 @@ fn eval(mut toks: &[Tok]) -> Option<(Sign, u128)> {
 
 fn parse(ident: &str) -> Option<Parsed> {
     let flat = ident.replace('_', "");
-    let mut toks = Vec::new();
-    if !split(&flat, &mut toks) {
-        return None;
-    }
+    let toks = Tokens { rest: &flat }.collect::<Option<Vec<Tok>>>()?;
 
     let Some(at) = toks.iter().position(|t| *t == Tok::Point) else {
         let (sign, int) = eval(&toks)?;
