@@ -131,7 +131,7 @@ fn eval(mut toks: &[Tok]) -> Option<(Sign, u128)> {
             Tok::And | Tok::Neg | Tok::Point | Tok::Unit(0) => return None,
             Tok::Unit(v) => {
                 let r = cur % HUNDRED;
-                let after_tens = v < TEEN_START && r >= TENS_START && r % TEN == 0;
+                let after_tens = v < TEEN_START && r >= TENS_START && r.is_multiple_of(TEN);
                 if r != 0 && !after_tens {
                     return None;
                 }
@@ -139,7 +139,7 @@ fn eval(mut toks: &[Tok]) -> Option<(Sign, u128)> {
                 seen = true;
             }
             Tok::Tens(v) => {
-                if cur % HUNDRED != 0 {
+                if !cur.is_multiple_of(HUNDRED) {
                     return None;
                 }
                 cur += v;
@@ -215,9 +215,9 @@ fn value_src(p: &Parsed) -> String {
     }
 }
 
-fn fn_src(name: &str, p: &Parsed) -> TokenStream {
+fn fn_src(vis: &str, name: &str, p: &Parsed) -> TokenStream {
     format!(
-        "fn {name}<T>() -> T \
+        "{vis} fn {name}<T>() -> T \
          where T: ::core::str::FromStr, <T as ::core::str::FromStr>::Err: ::core::fmt::Debug \
          {{ {:?}.parse().expect(\"number does not fit target type\") }}",
         value_src(p),
@@ -243,23 +243,66 @@ fn error_at(span: Span, msg: &str) -> TokenStream {
     trees.into_iter().collect()
 }
 
-/// Brings number functions into scope: `import!(forty_two, minus_five);`
-#[proc_macro]
-pub fn import(item: TokenStream) -> TokenStream {
+fn tail(rest: &[TokenTree]) -> Option<Vec<TokenTree>> {
+    if let Some(TokenTree::Group(g)) = rest.last() && g.delimiter() == Delimiter::Brace {
+        return Some(g.stream().into_iter().collect());
+    }
+
+    let colon = rest
+        .iter()
+        .rposition(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ':'))?;
+
+    Some(rest[colon + 1..].to_vec())
+}
+
+fn names(tail: &[TokenTree]) -> Result<Vec<(Ident, String)>, TokenStream> {
+    let mut out = Vec::new();
+    let is_comma = |t: &TokenTree| matches!(t, TokenTree::Punct(p) if p.as_char() == ',');
+
+    for entry in tail.split(is_comma) {
+        let (orig, alias) = match entry {
+            [] => continue,
+            [TokenTree::Ident(i)] => (i, i.to_string()),
+            [TokenTree::Ident(i), TokenTree::Ident(kw), TokenTree::Ident(a)]
+                if kw.to_string() == "as" =>
+            {
+                (i, a.to_string())
+            }
+            [first, ..] => return Err(error_at(first.span(), "expected a number name")),
+        };
+        out.push((orig.clone(), alias));
+    }
+
+    Ok(out)
+}
+
+#[proc_macro_attribute]
+pub fn numbers(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let trees: Vec<TokenTree> = item.into_iter().collect();
+    let is_use = |t: &TokenTree| matches!(t, TokenTree::Ident(i) if i.to_string() == "use");
+    let Some(use_at) = trees.iter().position(is_use) else {
+        return error_at(Span::call_site(), "#[numbers] goes on a `use` item");
+    };
+
+    let vis = trees[..use_at].iter().cloned().collect::<TokenStream>().to_string();
+    let rest = match &trees[use_at + 1..] {
+        [head @ .., TokenTree::Punct(p)] if p.as_char() == ';' => head,
+        all => all,
+    };
+    let Some(tail) = tail(rest) else {
+        return error_at(Span::call_site(), "expected `use rust_num::name;`");
+    };
+    let names = match names(&tail) {
+        Ok(names) => names,
+        Err(err) => return err,
+    };
+
     let mut out = TokenStream::new();
-
-    for tt in item {
-        let ident = match tt {
-            TokenTree::Ident(ident) => ident,
-            TokenTree::Punct(p) if p.as_char() == ',' => continue,
-            other => return error_at(other.span(), "import! takes comma separated names"),
+    for (orig, alias) in names {
+        let Some(parsed) = parse(&orig.to_string()) else {
+            return error_at(orig.span(), "not an English number");
         };
-
-        let name = ident.to_string();
-        let Some(parsed) = parse(&name) else {
-            return error_at(ident.span(), "not an English number");
-        };
-        out.extend(fn_src(&name, &parsed));
+        out.extend(fn_src(&vis, &alias, &parsed));
     }
 
     out
@@ -289,7 +332,7 @@ fn hundreds(n: u128, out: &mut Vec<&'static str>) {
     }
 
     out.push(word(Tok::Tens(r / TEN * TEN)));
-    if r % TEN > 0 {
+    if r.is_multiple_of(10) {
         out.push(word(Tok::Unit(r % TEN)));
     }
 }
@@ -323,7 +366,6 @@ fn compile_error(msg: &str) -> TokenStream {
         .expect("valid compile_error")
 }
 
-/// Reverse direction: `words!(2026)` -> "two thousand twenty six".
 #[proc_macro]
 pub fn words(item: TokenStream) -> TokenStream {
     let flat = item.to_string().replace(['_', ' '], "");

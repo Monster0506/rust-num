@@ -1,19 +1,21 @@
-use rust_num::{import, words};
+use rust_num::{numbers, words};
 
-import!(
+#[numbers]
+use rust_num::{
     twothousandtwentysix,
     minus_forty_two,
-    one_hundred_twenty_three_million_four_hundred_fifty_six_thousand_seven_hundred_and_eighty_nine,
+    one_hundred_twenty_three_million_four_hundred_fifty_six_thousand_seven_hundred_and_eighty_nine as big_n,
     three_hundred_undecillion,
     three_point_one_four_one_five_nine,
     zero_point_five,
     minus_two_point_seven_five,
-);
+};
 
 mod calendar {
-    use rust_num::import;
+    use rust_num::numbers;
 
-    import!(seven, twentyfour);
+    #[numbers]
+    use rust_num::{seven, twentyfour};
 
     pub fn days() -> u32 {
         seven()
@@ -27,7 +29,7 @@ mod calendar {
 fn main() {
     let year: u32 = twothousandtwentysix();
     let cold: i64 = minus_forty_two();
-    let big: u64 = one_hundred_twenty_three_million_four_hundred_fifty_six_thousand_seven_hundred_and_eighty_nine();
+    let big: u64 = big_n();
     let huge: u128 = three_hundred_undecillion();
     println!("year={year} cold={cold} big={big} huge={huge}");
 
@@ -37,6 +39,7 @@ fn main() {
     println!("pi={pi} half={half} chill={chill}");
 
     println!("days={} hours={}", calendar::days(), calendar::hours());
+
 
     println!("{}", words!(2026));
     println!("{}", words!(-1_000_001));
