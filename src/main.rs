@@ -1,4 +1,4 @@
-use rust_num::{numbers, words};
+use rust_num::numbers;
 
 #[numbers]
 use rust_num::{
@@ -39,9 +39,4 @@ fn main() {
     println!("pi={pi} half={half} chill={chill}");
 
     println!("days={} hours={}", calendar::days(), calendar::hours());
-
-
-    println!("{}", words!(2026));
-    println!("{}", words!(-1_000_001));
-    println!("{}", words!(3.14));
 }

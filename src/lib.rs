@@ -1,4 +1,7 @@
-use proc_macro::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
+use proc_macro::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
+use quote::quote;
+use syn::{Ident, ItemUse, UseTree, parse_macro_input};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Tok {
@@ -196,7 +199,7 @@ fn parse(ident: &str) -> Option<Parsed> {
         let Tok::Unit(d @ 0..=9) = *tok else {
             return None;
         };
-        frac.push(char::from_digit(d as u32, DIGIT_RADIX)?);
+        frac.push(char::from_digit(u32::try_from(d).ok()?, DIGIT_RADIX)?);
     }
 
     Some(Parsed {
@@ -215,62 +218,46 @@ fn value_src(p: &Parsed) -> String {
     }
 }
 
-fn fn_src(vis: &str, name: &str, p: &Parsed) -> TokenStream {
-    format!(
-        "{vis} fn {name}<T>() -> T \
-         where T: ::core::str::FromStr, <T as ::core::str::FromStr>::Err: ::core::fmt::Debug \
-         {{ {:?}.parse().expect(\"number does not fit target type\") }}",
-        value_src(p),
-    )
-    .parse()
-    .expect("valid fn")
-}
-
-fn error_at(span: Span, msg: &str) -> TokenStream {
-    let mut name = Ident::new("compile_error", span);
-    name.set_span(span);
-    let mut bang = Punct::new('!', Spacing::Alone);
-    bang.set_span(span);
-    let mut lit = Literal::string(msg);
-    lit.set_span(span);
-    let mut args = Group::new(Delimiter::Parenthesis, TokenTree::from(lit).into());
-    args.set_span(span);
-    let mut semi = Punct::new(';', Spacing::Alone);
-    semi.set_span(span);
-
-    let trees: [TokenTree; 4] = [name.into(), bang.into(), args.into(), semi.into()];
-
-    trees.into_iter().collect()
-}
-
-fn tail(rest: &[TokenTree]) -> Option<Vec<TokenTree>> {
-    if let Some(TokenTree::Group(g)) = rest.last() && g.delimiter() == Delimiter::Brace {
-        return Some(g.stream().into_iter().collect());
+fn collect(tree: &UseTree, out: &mut Vec<(Ident, Ident)>) -> syn::Result<()> {
+    match tree {
+        UseTree::Path(p) => collect(&p.tree, out),
+        UseTree::Group(g) => g.items.iter().try_for_each(|t| collect(t, out)),
+        UseTree::Name(n) => {
+            out.push((n.ident.clone(), n.ident.clone()));
+            Ok(())
+        }
+        UseTree::Rename(r) => {
+            out.push((r.ident.clone(), r.rename.clone()));
+            Ok(())
+        }
+        UseTree::Glob(g) => Err(syn::Error::new_spanned(g, "globs are not supported")),
     }
-
-    let colon = rest
-        .iter()
-        .rposition(|t| matches!(t, TokenTree::Punct(p) if p.as_char() == ':'))?;
-
-    Some(rest[colon + 1..].to_vec())
 }
 
-fn names(tail: &[TokenTree]) -> Result<Vec<(Ident, String)>, TokenStream> {
-    let mut out = Vec::new();
-    let is_comma = |t: &TokenTree| matches!(t, TokenTree::Punct(p) if p.as_char() == ',');
+fn expand(item: &ItemUse) -> syn::Result<TokenStream2> {
+    let mut names = Vec::new();
+    collect(&item.tree, &mut names)?;
 
-    for entry in tail.split(is_comma) {
-        let (orig, alias) = match entry {
-            [] => continue,
-            [TokenTree::Ident(i)] => (i, i.to_string()),
-            [TokenTree::Ident(i), TokenTree::Ident(kw), TokenTree::Ident(a)]
-                if kw.to_string() == "as" =>
-            {
-                (i, a.to_string())
-            }
-            [first, ..] => return Err(error_at(first.span(), "expected a number name")),
+    let attrs = &item.attrs;
+    let vis = &item.vis;
+    let mut out = TokenStream2::new();
+
+    for (orig, alias) in names {
+        let Some(parsed) = parse(&orig.to_string()) else {
+            return Err(syn::Error::new(orig.span(), "not an English number"));
         };
-        out.push((orig.clone(), alias));
+        let value = value_src(&parsed);
+
+        out.extend(quote! {
+            #(#attrs)*
+            #vis fn #alias<T>() -> T
+            where
+                T: ::core::str::FromStr,
+                <T as ::core::str::FromStr>::Err: ::core::fmt::Debug,
+            {
+                #value.parse().expect("number does not fit target type")
+            }
+        });
     }
 
     Ok(out)
@@ -278,124 +265,9 @@ fn names(tail: &[TokenTree]) -> Result<Vec<(Ident, String)>, TokenStream> {
 
 #[proc_macro_attribute]
 pub fn numbers(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    let trees: Vec<TokenTree> = item.into_iter().collect();
-    let is_use = |t: &TokenTree| matches!(t, TokenTree::Ident(i) if i.to_string() == "use");
-    let Some(use_at) = trees.iter().position(is_use) else {
-        return error_at(Span::call_site(), "#[numbers] goes on a `use` item");
-    };
+    let item = parse_macro_input!(item as ItemUse);
 
-    let vis = trees[..use_at].iter().cloned().collect::<TokenStream>().to_string();
-    let rest = match &trees[use_at + 1..] {
-        [head @ .., TokenTree::Punct(p)] if p.as_char() == ';' => head,
-        all => all,
-    };
-    let Some(tail) = tail(rest) else {
-        return error_at(Span::call_site(), "expected `use rust_num::name;`");
-    };
-    let names = match names(&tail) {
-        Ok(names) => names,
-        Err(err) => return err,
-    };
-
-    let mut out = TokenStream::new();
-    for (orig, alias) in names {
-        let Some(parsed) = parse(&orig.to_string()) else {
-            return error_at(orig.span(), "not an English number");
-        };
-        out.extend(fn_src(&vis, &alias, &parsed));
-    }
-
-    out
-}
-
-fn word(tok: Tok) -> &'static str {
-    WORDS
-        .iter()
-        .find(|(_, t)| *t == tok)
-        .map(|(w, _)| *w)
-        .expect("every token has a word")
-}
-
-fn hundreds(n: u128, out: &mut Vec<&'static str>) {
-    let h = n / HUNDRED;
-    if h > 0 {
-        out.push(word(Tok::Unit(h)));
-        out.push(word(Tok::Hundred));
-    }
-
-    let r = n % HUNDRED;
-    if r < TENS_START {
-        if r > 0 {
-            out.push(word(Tok::Unit(r)));
-        }
-        return;
-    }
-
-    out.push(word(Tok::Tens(r / TEN * TEN)));
-    if r.is_multiple_of(10) {
-        out.push(word(Tok::Unit(r % TEN)));
-    }
-}
-
-fn to_words(mut n: u128) -> Vec<&'static str> {
-    if n == 0 {
-        return vec![word(Tok::Unit(0))];
-    }
-
-    let mut out = Vec::new();
-    for (_, tok) in WORDS.iter().rev() {
-        let Tok::Scale(s) = *tok else {
-            continue;
-        };
-        if n < s {
-            continue;
-        }
-
-        hundreds(n / s, &mut out);
-        out.push(word(*tok));
-        n %= s;
-    }
-    hundreds(n, &mut out);
-
-    out
-}
-
-fn compile_error(msg: &str) -> TokenStream {
-    format!("compile_error!({msg:?});")
-        .parse()
-        .expect("valid compile_error")
-}
-
-#[proc_macro]
-pub fn words(item: TokenStream) -> TokenStream {
-    let flat = item.to_string().replace(['_', ' '], "");
-    let (neg, text) = match flat.strip_prefix('-') {
-        Some(t) => (true, t),
-        None => (false, flat.as_str()),
-    };
-    let (int, frac) = match text.split_once('.') {
-        Some((i, f)) => (i, Some(f)),
-        None => (text, None),
-    };
-    let Ok(n) = int.parse::<u128>() else {
-        return compile_error("words! expects an integer or decimal literal");
-    };
-
-    let mut out = Vec::new();
-    if neg {
-        out.push(word(Tok::Neg));
-    }
-    out.extend(to_words(n));
-
-    if let Some(frac) = frac {
-        out.push(word(Tok::Point));
-        for c in frac.chars() {
-            let Some(d) = c.to_digit(DIGIT_RADIX) else {
-                return compile_error("words! expects an integer or decimal literal");
-            };
-            out.push(word(Tok::Unit(d.into())));
-        }
-    }
-
-    TokenTree::from(Literal::string(&out.join(" "))).into()
+    expand(&item)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }
